@@ -5,6 +5,8 @@
 
 # Build artifacts
 native-host/.build/
+native-host/.build-local/
+.build-cache/
 dist/
 
 # IDE

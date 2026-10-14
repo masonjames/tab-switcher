@@ -15,6 +15,18 @@ var initialized = false;
 var slowSwitchOngoing = false;
 var fastSwitchOngoing = false;
 var nativeSwitchOngoing = false;
+// Preserve native message order across asynchronous Chrome API calls (including release).
+var nativeSwitchQueue = Promise.resolve();
+var enqueueNativeSwitch = function(operation) {
+    nativeSwitchQueue = nativeSwitchQueue.then(operation).catch(function(error) {
+        log("Native switch failed: " + error.message);
+        sendToNativeHost({ action: "hide_switcher" });
+        nativeSwitchOngoing = false;
+        uiShownDuringSwitch = false;
+        filteredMru = [];
+    });
+    return nativeSwitchQueue;
+};
 var intSwitchCount = 0;
 var lastIntSwitchIndex = 0;
 var slowswitchForward = false;
@@ -379,12 +391,13 @@ var initialize = function() {
 
 	if(!initialized) {
 		initialized = true;
-		chrome.windows.getAll({populate:true},function(windows){
-			windows.forEach(function(window){
-				window.tabs.forEach(function(tab){
-					mru.unshift(tab.id);
-				});
-			});
+        chrome.windows.getAll({populate:true},function(windows){
+            var tabs = windows.flatMap(window => window.tabs || []);
+            tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+            mru = tabs.map(tab => tab.id);
+            var focused = windows.find(window => window.focused);
+            var active = focused && focused.tabs.find(tab => tab.active);
+            if (active) putExistingTabToTop(active.id);
 			log("MRU after init: "+mru);
 		});
 	}
@@ -462,12 +475,12 @@ var captureCurrentTabThumbnail = function() {
 
 // Get tab data for the visual switcher (includes thumbnails, titles, favicons)
 // Uses filteredMru when in a native switch session, otherwise uses full mru
-var getTabDataForSwitcher = async function() {
+var getTabDataForSwitcher = async function(limit = 12) {
 	var tabData = [];
 	// Use filtered MRU during native switch, otherwise full MRU
 	var mruToUse = nativeSwitchOngoing ? filteredMru : mru;
 	
-	for (var i = 0; i < mruToUse.length; i++) {
+	for (var i = 0; i < mruToUse.length && tabData.length < limit; i++) {
 		var tabId = mruToUse[i];
 		try {
 			var tab = await chrome.tabs.get(tabId);
@@ -562,13 +575,13 @@ var connectNativeHost = function() {
 					pingTimeout = null;
 				}
 			} else if (message.action === "cycle_next") {
-				handleNativeCycle(1, message.show_ui, message.current_window_only);
+				enqueueNativeSwitch(() => handleNativeCycle(1, message.show_ui, message.current_window_only, message.recent_tab_limit));
 			} else if (message.action === "cycle_prev") {
-				handleNativeCycle(-1, message.show_ui, message.current_window_only);
+				enqueueNativeSwitch(() => handleNativeCycle(-1, message.show_ui, message.current_window_only, message.recent_tab_limit));
 			} else if (message.action === "request_show_ui") {
-				handleRequestShowUI(message.current_window_only);
+				enqueueNativeSwitch(() => handleRequestShowUI(message.current_window_only));
 			} else if (message.action === "end_switch") {
-				handleNativeEndSwitch();
+				enqueueNativeSwitch(() => handleNativeEndSwitch());
 			} else if (message.action === "copy_url") {
 				handleCopyUrl();
 			} else if (message.action === "error_no_accessibility") {
@@ -616,34 +629,28 @@ var uiShownDuringSwitch = false;
 // Window-filtered MRU list (only tabs from current window)
 var filteredMru = [];
 var currentWindowOnly = false;
+var sessionTabData = [];
 
 // Get filtered MRU based on current window setting
 var getFilteredMru = async function() {
-	if (!currentWindowOnly) {
-		return mru;
-	}
-	
 	// Get the current window
 	try {
 		var currentWindow = await chrome.windows.getCurrent();
 		var currentWindowId = currentWindow.id;
 		
-		// Filter MRU to only include tabs from current window
-		var filtered = [];
-		for (var i = 0; i < mru.length; i++) {
-			try {
-				var tab = await chrome.tabs.get(mru[i]);
-				if (tab && tab.windowId === currentWindowId) {
-					filtered.push(mru[i]);
-				}
-			} catch (e) {
-				// Tab may have been closed
-			}
-		}
-		return filtered.length > 0 ? filtered : mru; // Fallback to all tabs if window has only 1 tab
+        // Query once: large tab collections should not delay a quick Ctrl release.
+        var windowTabs = await chrome.tabs.query({ windowId: currentWindowId });
+        var ids = new Set(windowTabs.map(tab => tab.id));
+        var active = windowTabs.find(tab => tab.active);
+        if (active) {
+            if (!mru.includes(active.id)) addTabToMRUAtFront(active.id);
+            else putExistingTabToTop(active.id);
+        }
+        var filtered = currentWindowOnly ? mru.filter(id => ids.has(id)) : mru.slice();
+		return filtered; // Never cross windows when current-window mode is selected.
 	} catch (e) {
 		log("Error filtering MRU by window: " + e.message);
-		return mru;
+		return [];
 	}
 };
 
@@ -674,7 +681,7 @@ var isThisProfileFocused = async function() {
 // Handle cycle in either direction
 // direction: 1 for next, -1 for prev
 // showUI: whether to show the visual switcher
-var handleNativeCycle = async function(direction, showUI, windowOnly) {
+var handleNativeCycle = async function(direction, showUI, windowOnly, recentTabLimit) {
 	log("TabSwitch::NATIVE_CYCLE direction=" + direction + " showUI=" + showUI + " currentWindowOnly=" + windowOnly);
 	
 	// CRITICAL: Check if this profile's window is focused before responding
@@ -686,6 +693,7 @@ var handleNativeCycle = async function(direction, showUI, windowOnly) {
 		// If we were in a switch but lost focus, end it
 		if (nativeSwitchOngoing) {
 			log("TabSwitch::Lost focus mid-switch, ending");
+            sendToNativeHost({ action: "hide_switcher" });
 			nativeSwitchOngoing = false;
 			uiShownDuringSwitch = false;
 			filteredMru = [];
@@ -701,6 +709,10 @@ var handleNativeCycle = async function(direction, showUI, windowOnly) {
 		uiShownDuringSwitch = false;
 		currentWindowOnly = windowOnly !== false; // Default to true (current window only)
 		filteredMru = await getFilteredMru();
+        // Snapshot valid tabs once so card indices and activation IDs cannot drift.
+        var limit = Number.isInteger(recentTabLimit) ? Math.min(12, Math.max(2, recentTabLimit)) : 5;
+        sessionTabData = await getTabDataForSwitcher(limit);
+        filteredMru = sessionTabData.map(tab => tab.id);
 		log("TabSwitch::Using " + (currentWindowOnly ? "current window" : "all windows") + ", filteredMru length: " + filteredMru.length);
 	}
 	
@@ -724,7 +736,7 @@ var handleNativeCycle = async function(direction, showUI, windowOnly) {
 	// Show UI if requested and not already shown
 	if (showUI && !uiShownDuringSwitch) {
 		uiShownDuringSwitch = true;
-		var tabData = await getTabDataForSwitcher();
+		var tabData = sessionTabData;
 		sendToNativeHost({
 			action: "show_switcher",
 			tabs: tabData,
@@ -754,7 +766,7 @@ var handleRequestShowUI = async function(windowOnly) {
 	
 	if (nativeSwitchOngoing && !uiShownDuringSwitch) {
 		uiShownDuringSwitch = true;
-		var tabData = await getTabDataForSwitcher();
+		var tabData = sessionTabData;
 		sendToNativeHost({
 			action: "show_switcher",
 			tabs: tabData,
@@ -789,18 +801,18 @@ var handleNativeEndSwitch = async function() {
 		
 		// NOW actually switch to the selected tab (use filteredMru which was set during this switch)
 		var tabIdToActivate = filteredMru[lastIntSwitchIndex];
-		if (tabIdToActivate) {
-			chrome.tabs.get(tabIdToActivate, function(tab) {
-				if (tab) {
-					chrome.windows.update(tab.windowId, {"focused": true});
-					chrome.tabs.update(tabIdToActivate, {active: true, highlighted: true});
-				}
-			});
-		}
-		
-		// End the switch and update MRU
-		endSwitch();
-		
+        try {
+            if (tabIdToActivate !== undefined) {
+                var tab = await chrome.tabs.get(tabIdToActivate);
+                await chrome.windows.update(tab.windowId, { focused: true });
+                await chrome.tabs.update(tabIdToActivate, { active: true, highlighted: true });
+                // filteredMru indices are not indices into the full MRU.
+                putExistingTabToTop(tabIdToActivate);
+            }
+        } finally {
+            nativeSwitchOngoing = false;
+        }
+
 		// Reset filtered state
 		filteredMru = [];
 		currentWindowOnly = false;

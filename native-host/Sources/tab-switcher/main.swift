@@ -4,6 +4,8 @@ import SwiftUI
 import Carbon.HIToolbox
 import ApplicationServices
 import Sparkle
+import EventTapLifecycle
+import CompanionPolicy
 import UserNotifications
 
 let APP_VERSION = "3.7.5"
@@ -272,21 +274,21 @@ class BrowserConfigManager: ObservableObject {
 
     private let configURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let configDir = appSupport.appendingPathComponent("TabSwitcher")
+        let configDir = appSupport.appendingPathComponent(configurationDirectory)
         try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         return configDir.appendingPathComponent("browser_config.json")
     }()
 
     private let cachedBrowserListURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let configDir = appSupport.appendingPathComponent("TabSwitcher")
+        let configDir = appSupport.appendingPathComponent(configurationDirectory)
         try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         return configDir.appendingPathComponent("browser_list_cache.json")
     }()
 
     private let shortcutsURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let configDir = appSupport.appendingPathComponent("TabSwitcher")
+        let configDir = appSupport.appendingPathComponent(configurationDirectory)
         try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         return configDir.appendingPathComponent("shortcuts.json")
     }()
@@ -312,7 +314,7 @@ class BrowserConfigManager: ObservableObject {
         updateShortcutGlobals(from: shortcuts)
         // Notify other instances
         DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.tabswitcher.shortcutsChanged"),
+            NSNotification.Name(ipcNamespace + ".shortcutsChanged"),
             object: nil,
             userInfo: nil,
             deliverImmediately: true
@@ -400,12 +402,15 @@ class BrowserConfigManager: ObservableObject {
     }
     
     func saveConfig() {
-        if let data = try? JSONEncoder().encode(browsers) {
-            try? data.write(to: configURL)
-        }
-        updateManifests()
+        do {
+            try JSONEncoder().encode(browsers).write(to: configURL, options: .atomic)
+            updateManifests()
+            DistributedNotificationCenter.default().postNotificationName(
+                browserConfigurationNotification(namespace: ipcNamespace), object: nil,
+                userInfo: nil, deliverImmediately: true)
+        } catch { CompanionSettings.shared.errorMessage = "Could not save browsers: \(error.localizedDescription)" }
     }
-    
+
     func enableBrowser(id: String) {
         if let index = browsers.firstIndex(where: { $0.id == id }) {
             browsers[index].isEnabled = true
@@ -428,51 +433,25 @@ class BrowserConfigManager: ObservableObject {
     }
     
     func updateManifests() {
-        // Use the actual path of the running app binary, not hardcoded path
-        let nativeHostPath: String
-        if let bundlePath = Bundle.main.executablePath {
-            nativeHostPath = bundlePath
-            debugLog("Using actual binary path for manifest: \(bundlePath)")
-        } else {
-            // Fallback to expected installation path
-            nativeHostPath = "/Applications/Tab Switcher.app/Contents/MacOS/tab-switcher"
-            debugLog("Using fallback binary path for manifest: \(nativeHostPath)")
+        guard let executable = Bundle.main.executablePath else { return }
+        let localID = Bundle.main.object(forInfoDictionaryKey: "TabSwitcherLocalExtensionID") as? String
+        // Fail closed if a malformed local bundle has lost its paired extension identity.
+        guard !isLocalBuild || (localID?.count == 32 && localID!.allSatisfy { ("a"..."p").contains(String($0)) }) else {
+            CompanionSettings.shared.errorMessage = "Local extension identity missing. Rebuild with build-local.sh."
+            return
         }
-        
         for browser in browsers {
-            let manifestDir = browser.fullNativeMessagingPath
-            let manifestPath = "\(manifestDir)/com.tabswitcher.native.json"
-
-            if browser.isEnabled {
-                // Create manifest directory if needed
-                try? FileManager.default.createDirectory(atPath: manifestDir, withIntermediateDirectories: true)
-
-                // Always include CWS extension ID; also include legacy manual ID for backward compat
-                var origins = ["chrome-extension://\(CWS_EXTENSION_ID)/"]
-                if let legacyId = browser.extensionId, !legacyId.isEmpty, legacyId != CWS_EXTENSION_ID {
-                    origins.append("chrome-extension://\(legacyId)/")
-                }
-
-                // Create manifest
-                let manifest: [String: Any] = [
-                    "name": "com.tabswitcher.native",
-                    "description": "Tab Switcher Native Helper",
-                    "path": nativeHostPath,
-                    "type": "stdio",
-                    "allowed_origins": origins
-                ]
-
-                if let data = try? JSONSerialization.data(withJSONObject: manifest, options: .prettyPrinted) {
-                    try? data.write(to: URL(fileURLWithPath: manifestPath))
-                    debugLog("Created manifest for \(browser.name) at \(manifestPath)")
-                }
-            } else {
-                // Remove manifest if disabled
-                try? FileManager.default.removeItem(atPath: manifestPath)
+            let registration = NativeHostRegistration(localExtensionID: isLocalBuild ? localID : nil,
+                upstreamID: CWS_EXTENSION_ID, legacyID: browser.extensionId)
+            do {
+                try registration.update(directory: URL(fileURLWithPath: browser.fullNativeMessagingPath),
+                                        executable: executable, enabled: browser.isEnabled)
+            } catch {
+                CompanionSettings.shared.errorMessage = "Could not register \(browser.name): \(error.localizedDescription)"
             }
         }
     }
-    
+
     var enabledBundleIds: Set<String> {
         Set(browsers.filter { $0.isEnabled }.map { $0.id })
     }
@@ -497,12 +476,14 @@ final class UpdaterViewModel: ObservableObject {
     }
 
     func startUpdater() {
+        guard !isLocalBuild, companionOwnsInstance else { return }
         updaterController.startUpdater()
         updaterController.updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
     }
 
     func checkForUpdates() {
+        guard !isLocalBuild, companionOwnsInstance else { return }
         updaterController.checkForUpdates(nil)
     }
 }
@@ -530,7 +511,7 @@ class BackgroundUpdateChecker: NSObject, ObservableObject, UNUserNotificationCen
 
     private let notifiedVersionsURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let configDir = appSupport.appendingPathComponent("TabSwitcher")
+        let configDir = appSupport.appendingPathComponent(configurationDirectory)
         try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         return configDir.appendingPathComponent("notified_versions.json")
     }()
@@ -623,13 +604,14 @@ class BackgroundUpdateChecker: NSObject, ObservableObject, UNUserNotificationCen
         if isUpdateCheckLeader {
             try? FileManager.default.removeItem(at: updateCheckerLockFile)
             DistributedNotificationCenter.default().postNotificationName(
-                NSNotification.Name("com.tabswitcher.updateCheckerResigned"),
+                NSNotification.Name(ipcNamespace + ".updateCheckerResigned"),
                 object: nil, userInfo: nil, deliverImmediately: true
             )
         }
     }
 
     func tryTakeOverLeadership() {
+        guard !isLocalBuild else { return }
         guard !isUpdateCheckLeader else { return }
         if tryBecomeUpdateCheckLeader() {
             isUpdateCheckLeader = true
@@ -641,6 +623,7 @@ class BackgroundUpdateChecker: NSObject, ObservableObject, UNUserNotificationCen
     // MARK: - Periodic Checking
 
     func startPeriodicChecks() {
+        guard !isLocalBuild else { return }
         isUpdateCheckLeader = tryBecomeUpdateCheckLeader()
         guard isUpdateCheckLeader else {
             debugLog("Not the update check leader, skipping periodic checks")
@@ -783,17 +766,18 @@ class BackgroundUpdateChecker: NSObject, ObservableObject, UNUserNotificationCen
     }
 
     private func handleAppUpdateClick() {
+        guard companionOwnsInstance, !isLocalBuild else { return }
         debugLog("User clicked app update notification")
 
         // Post distributed notification for any directly-launched instance to handle
         DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.tabswitcher.triggerAppUpdate"),
+            NSNotification.Name(ipcNamespace + ".triggerAppUpdate"),
             object: nil, userInfo: nil, deliverImmediately: true
         )
 
         // Check if a directly-launched instance exists
         let hasDirectInstance = NSWorkspace.shared.runningApplications.contains {
-            $0.bundleIdentifier == Bundle.main.bundleIdentifier && $0.activationPolicy == .regular
+            $0.processIdentifier == getpid() && companionOwnsInstance
         }
 
         if !hasDirectInstance {
@@ -812,10 +796,11 @@ class BackgroundUpdateChecker: NSObject, ObservableObject, UNUserNotificationCen
     }
 
     private func handleExtensionUpdateClick() {
+        guard companionOwnsInstance else { return }
         debugLog("User clicked extension update notification")
 
         DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.tabswitcher.showExtensionUpdate"),
+            NSNotification.Name(ipcNamespace + ".showExtensionUpdate"),
             object: nil, userInfo: nil, deliverImmediately: true
         )
 
@@ -950,13 +935,15 @@ struct SetupView: View {
                                 .frame(width: 64, height: 64)
                                 .padding(.bottom, 4)
                         }
-                        Text("Tab Switcher")
+                        Text(isLocalBuild ? "Tab Switcher Local" : "Tab Switcher")
                             .font(.system(size: 18, weight: .bold))
                         Text("v\(APP_VERSION)")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
                     }
                     .padding(.top, 8)
+
+                    CompanionSettingsView()
 
                     // Browsers
                     VStack(alignment: .leading, spacing: 8) {
@@ -985,6 +972,9 @@ struct SetupView: View {
                         }
                         .background(Color.secondary.opacity(0.06))
                         .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                        Text("Hold the switch modifier and press the switch key to move forward. While switching, press ` (backtick) or add Shift to move backward. Release the modifier to select.")
+                            .font(.caption).foregroundColor(.secondary)
 
                         Button("Reset to Defaults") {
                             configManager.shortcuts = .defaults
@@ -1049,7 +1039,7 @@ struct SetupView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
-                .disabled(!configManager.browsers.contains { $0.isEnabled })
+
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 12)
@@ -1434,7 +1424,7 @@ struct TabCardView: View {
     let tab: TabInfo
     let isSelected: Bool
     let cornerRadius: CGFloat = 10
-    let cardWidth: CGFloat = 220
+    let cardWidth: CGFloat
     let cardHeight: CGFloat = 146
     
     var body: some View {
@@ -1545,24 +1535,18 @@ struct TabSwitcherView: View {
     
     var body: some View {
         if state.isVisible && !state.tabs.isEmpty {
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: cardSpacing) {
-                        ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
-                            TabCardView(
-                                tab: tab,
-                                isSelected: index == state.selectedIndex
-                            )
-                            .id(index)
-                        }
-                    }
-                    .padding(padding)
-                }
-                .onChange(of: state.selectedIndex) {
-                    withAnimation(.easeOut(duration: 0.1)) {
-                        proxy.scrollTo(state.selectedIndex, anchor: .center)
+            GeometryReader { geometry in
+                let gaps = CGFloat(max(0, state.tabs.count - 1)) * cardSpacing
+                let fittedWidth = min(cardWidth, max(1,
+                    (geometry.size.width - padding * 2 - gaps) / CGFloat(state.tabs.count)))
+                HStack(spacing: cardSpacing) {
+                    ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
+                        TabCardView(tab: tab, isSelected: index == state.selectedIndex,
+                                    cardWidth: fittedWidth)
                     }
                 }
+                .padding(padding)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .background(
                 VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
@@ -1717,8 +1701,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var toastCancellable: AnyCancellable?
     var setupCancellable: AnyCancellable?
     var launchedDirectly = false
+    var startupRole: StartupRole = .nativeHost
+    var statusItem: NSStatusItem?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let launchEvent = NSAppleEventManager.shared().currentAppleEvent
+        let loginItem = launchEvent?.eventID == kAEOpenApplication &&
+            launchEvent?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+        startupRole = .resolve(nativeHost: !launchedDirectly, loginItem: loginItem)
+        if launchedDirectly {
+            do {
+                let lockURL = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent(".\(ipcNamespace).companion.lock")
+                guard try companionInstanceLock.acquire(at: lockURL) else {
+                    if startupRole.showsSettingsOnLaunch { notifyExistingInstancesToShowConfig() }
+                    NSApp.terminate(nil)
+                    return
+                }
+                companionOwnsInstance = true
+            } catch {
+                debugLog("Cannot acquire companion lock: \(error)")
+                NSApp.terminate(nil)
+                return
+            }
+            applyCompanionAppearance()
+            if startupRole.showsSettingsOnLaunch { _ = checkAccessibilityPermission(prompt: true) }
+        }
         // Setup application menu (for Cmd+Q support)
         if launchedDirectly {
             setupMainMenu()
@@ -1726,7 +1734,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("App delegate launched, launchedDirectly=\(launchedDirectly)")
 
         // Setup macOS system notifications for background update checking
-        BackgroundUpdateChecker.shared.setupNotifications()
+        if startupRole.showsSettingsOnLaunch && !isLocalBuild {
+            BackgroundUpdateChecker.shared.setupNotifications()
+            updaterViewModel.startUpdater()
+        }
         
         // Create the floating window for tab switching UI
         window = TabSwitcherWindow()
@@ -1762,8 +1773,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Only show setup UI when launched directly (from Finder/Dock)
         // Native messaging launches should NEVER show UI or dock icon
-        if launchedDirectly {
-            debugLog("Direct launch - showing setup window")
+        if startupRole.showsSettingsOnLaunch {
+            debugLog("Interactive launch - showing setup window")
             // Always set showingSetup to true for direct launches so the window stays open
             allowConfigUI = true
             BrowserConfigManager.shared.showingSetup = true
@@ -1780,13 +1791,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 
                 // CRITICAL: Never process for native messaging instances unless user requested it
-                if !self.launchedDirectly && !allowConfigUI {
+                if !companionOwnsInstance {
                     return
                 }
                 
                 DispatchQueue.main.async {
                     if showing {
-                        NSApp.setActivationPolicy(.regular)
                         self.showSetupWindow()
                     } else {
                         self.setupWindow?.close()
@@ -1862,6 +1872,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
+    func applyCompanionAppearance() {
+        guard companionOwnsInstance else { return }
+        let preferences = CompanionSettings.shared.preferences
+        NSApp.setActivationPolicy(startupRole.showsDock(preferences: preferences) ? .regular : .accessory)
+        if startupRole.showsMenu(preferences: preferences) {
+            if statusItem == nil {
+                statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+                statusItem?.button?.image = NSImage(systemSymbolName: "rectangle.on.rectangle", accessibilityDescription: "Tab Switcher Settings")
+                let menu = NSMenu()
+                let settings = menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+                settings.target = self
+                menu.addItem(.separator())
+                menu.addItem(withTitle: "Quit Tab Switcher", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+                statusItem?.menu = menu
+            }
+        } else if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItem = nil
+        }
+    }
+
+    @objc func openSettings() {
+        guard companionOwnsInstance else { return }
+        BrowserConfigManager.shared.showingSetup = true
+        showSetupWindow()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
     func showSetupWindow() {
         if setupWindow == nil {
             let setupView = SetupView()
@@ -1871,7 +1910,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 backing: .buffered,
                 defer: false
             )
-            setupWindow?.title = "Tab Switcher"
+            setupWindow?.title = isLocalBuild ? "Tab Switcher Local" : "Tab Switcher"
             setupWindow?.titlebarAppearsTransparent = true
             setupWindow?.contentView = NSHostingView(rootView: setupView)
             setupWindow?.center()
@@ -1882,7 +1921,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         // Ensure we can receive focus/menus even if we were running as a background app
-        NSApp.setActivationPolicy(.regular)
+        guard companionOwnsInstance else { return }
+        applyCompanionAppearance()
         if NSApp.mainMenu == nil {
             setupMainMenu()
         }
@@ -1901,7 +1941,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let checkForUpdatesItem = NSMenuItem(title: "Check for Updates...",
             action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
         checkForUpdatesItem.target = updaterViewModel.updaterController
-        appMenu.addItem(checkForUpdatesItem)
+        if !isLocalBuild { appMenu.addItem(checkForUpdatesItem) }
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Hide Tab Switcher", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthersItem = appMenu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
@@ -1935,9 +1975,12 @@ extension AppDelegate: NSWindowDelegate {
 extension AppDelegate {
     // Called when user clicks dock icon while app is running
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            allowConfigUI = true
-            BrowserConfigManager.shared.showingSetup = true
+        if companionOwnsInstance {
+            openSettings()
+        } else {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration)
         }
         return true
     }
@@ -1980,6 +2023,7 @@ func debugLog(_ message: String) {
 // MARK: - Native Messaging Protocol
 
 func sendMessage(_ dict: [String: Any]) {
+    guard !isLaunchedDirectly() else { return }
     guard let jsonData = try? JSONSerialization.data(withJSONObject: dict, options: []) else {
         debugLog("Failed to serialize message")
         return
@@ -2203,6 +2247,7 @@ func getActiveBrowserBundleId() -> String? {
 
 var switchModifierIsPressed = false
 var switchInProgress = false
+var switchBrowserBundleId: String?
 var tabPressCount = 0
 var ownerBrowserBundleId: String? = nil  // The browser that launched this native host instance
 var ownerBrowserProcessId: pid_t? = nil  // The PID of the specific browser process that launched us
@@ -2286,53 +2331,19 @@ func detectParentBrowser() -> (String, pid_t)? {
     debugLog("Could not detect parent browser after walking tree")
     return nil
 }
-var showUITimer: DispatchWorkItem? = nil
-let showUIDelay: Double = 0.15 // 150ms delay before showing UI
 
 // Lock file for event tap coordination - only one native host should have the event tap
-let eventTapLockFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".tabswitcher_eventtap.lock")
+let eventTapLockFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(isLocalBuild ? ".tabswitcher_local_eventtap.lock" : ".tabswitcher_eventtap.lock")
 
 // Check if we should be the event tap leader (first one to claim the lock)
+let eventTapInstanceLock = InstanceLock()
 func tryBecomeEventTapLeader() -> Bool {
-    let myPid = getpid()
-    
-    // Check if lock file exists
-    if FileManager.default.fileExists(atPath: eventTapLockFile.path) {
-        // Read existing PID
-        if let contents = try? String(contentsOf: eventTapLockFile, encoding: .utf8),
-           let existingPid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            // Check if that process is still running AND is actually Tab Switcher
-            if kill(existingPid, 0) == 0 {
-                // Process exists, but verify it's actually Tab Switcher
-                if let app = NSRunningApplication(processIdentifier: existingPid),
-                   app.bundleIdentifier == Bundle.main.bundleIdentifier {
-                    // It's actually our app - we're not the leader
-                    debugLog("Another Tab Switcher instance (PID \(existingPid)) owns the event tap, we (PID \(myPid)) will listen only")
-                    return false
-                } else {
-                    // PID exists but it's not Tab Switcher - stale lock file
-                    debugLog("Lock file has PID \(existingPid) but it's not Tab Switcher - removing stale lock")
-                    try? FileManager.default.removeItem(at: eventTapLockFile)
-                }
-            } else {
-                // Process doesn't exist - stale lock file
-                debugLog("Lock file has dead PID \(existingPid) - removing stale lock")
-                try? FileManager.default.removeItem(at: eventTapLockFile)
-            }
-        } else {
-            // Couldn't read PID from lock file - remove it
-            debugLog("Lock file exists but couldn't read PID - removing")
-            try? FileManager.default.removeItem(at: eventTapLockFile)
-        }
-    }
-    
-    // Claim the lock
     do {
-        try String(myPid).write(to: eventTapLockFile, atomically: true, encoding: .utf8)
-        debugLog("We (PID \(myPid)) are now the event tap leader")
+        guard try eventTapInstanceLock.acquire(at: eventTapLockFile.appendingPathExtension("owner")) else { return false }
+        try String(getpid()).write(to: eventTapLockFile, atomically: true, encoding: .utf8)
         return true
     } catch {
-        debugLog("Failed to write lock file: \(error)")
+        debugLog("Failed to claim event tap leadership: \(error)")
         return false
     }
 }
@@ -2356,12 +2367,12 @@ func cleanupEventTapLock() {
 }
 
 // Distributed notification names for IPC between native hosts
-let ctrlTabNotificationName = "com.tabswitcher.ctrlTab"
-let ctrlReleaseNotificationName = "com.tabswitcher.ctrlRelease"
-let leaderResignedNotificationName = "com.tabswitcher.leaderResigned"
-let showConfigNotificationName = "com.tabswitcher.showConfig"
-let copyUrlNotificationName = "com.tabswitcher.copyUrl"
-let shortcutsChangedNotificationName = "com.tabswitcher.shortcutsChanged"
+let ctrlTabNotificationName = ipcNamespace + ".ctrlTab"
+let ctrlReleaseNotificationName = ipcNamespace + ".ctrlRelease"
+let leaderResignedNotificationName = ipcNamespace + ".leaderResigned"
+let showConfigNotificationName = ipcNamespace + ".showConfig"
+let copyUrlNotificationName = ipcNamespace + ".copyUrl"
+let shortcutsChangedNotificationName = ipcNamespace + ".shortcutsChanged"
 
 // Setup listener for distributed notifications (for non-leader hosts)
 func setupNotificationListener() {
@@ -2388,7 +2399,8 @@ func setupNotificationListener() {
         sendMessage([
             "action": direction,
             "show_ui": showUI,
-            "current_window_only": !combineWindows
+            "current_window_only": !combineWindows,
+            "recent_tab_limit": CompanionSettings.shared.preferences.recentTabLimit
         ])
     }
     
@@ -2405,7 +2417,7 @@ func setupNotificationListener() {
         sendAction("end_switch")
     }
     
-    center.addObserver(forName: NSNotification.Name("com.tabswitcher.requestShowUI"), object: nil, queue: .main) { notification in
+    center.addObserver(forName: NSNotification.Name(ipcNamespace + ".requestShowUI"), object: nil, queue: .main) { notification in
         guard let userInfo = notification.userInfo,
               let combineWindows = userInfo["combineWindows"] as? Bool else {
             return
@@ -2444,6 +2456,7 @@ func setupNotificationListener() {
     
     // Listen for show-config request (from directly-launched app trying to show UI)
     center.addObserver(forName: NSNotification.Name(showConfigNotificationName), object: nil, queue: .main) { _ in
+        guard companionOwnsInstance else { return }
         debugLog("Received show-config notification")
         // Show the config window if we have one
         DispatchQueue.main.async {
@@ -2464,6 +2477,14 @@ func setupNotificationListener() {
         sendMessage(["action": "copy_url"])
     }
 
+    center.addObserver(forName: NSNotification.Name(ipcNamespace + ".preferencesChanged"), object: nil, queue: .main) { _ in
+        CompanionSettings.shared.reload()
+    }
+
+    _ = observeBrowserConfigurationChanges(namespace: ipcNamespace) {
+        BrowserConfigManager.shared.loadConfig()
+    }
+
     // Listen for shortcut config changes from other instances
     center.addObserver(forName: NSNotification.Name(shortcutsChangedNotificationName), object: nil, queue: .main) { _ in
         debugLog("Received shortcuts-changed notification, reloading")
@@ -2471,7 +2492,7 @@ func setupNotificationListener() {
     }
 
     // Listen for app update trigger (from notification click)
-    center.addObserver(forName: NSNotification.Name("com.tabswitcher.triggerAppUpdate"), object: nil, queue: .main) { _ in
+    center.addObserver(forName: NSNotification.Name(ipcNamespace + ".triggerAppUpdate"), object: nil, queue: .main) { _ in
         debugLog("Received triggerAppUpdate notification")
         if let delegate = NSApp.delegate as? AppDelegate, delegate.launchedDirectly {
             allowConfigUI = true
@@ -2484,7 +2505,8 @@ func setupNotificationListener() {
     }
 
     // Listen for extension update display request (from notification click)
-    center.addObserver(forName: NSNotification.Name("com.tabswitcher.showExtensionUpdate"), object: nil, queue: .main) { _ in
+    center.addObserver(forName: NSNotification.Name(ipcNamespace + ".showExtensionUpdate"), object: nil, queue: .main) { _ in
+        guard companionOwnsInstance else { return }
         debugLog("Received showExtensionUpdate notification")
         DispatchQueue.main.async {
             allowConfigUI = true
@@ -2494,7 +2516,7 @@ func setupNotificationListener() {
     }
 
     // Listen for update checker leader resignation
-    center.addObserver(forName: NSNotification.Name("com.tabswitcher.updateCheckerResigned"), object: nil, queue: .main) { _ in
+    center.addObserver(forName: NSNotification.Name(ipcNamespace + ".updateCheckerResigned"), object: nil, queue: .main) { _ in
         debugLog("Update checker leader resigned, attempting to take over")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             BackgroundUpdateChecker.shared.tryTakeOverLeadership()
@@ -2503,35 +2525,21 @@ func setupNotificationListener() {
 
     debugLog("Notification listener setup complete (PID \(myProcessId), browser=\(ownerBrowserBundleId ?? "unknown"))")
     
-    // Periodic check for dead leader (backup in case leader crashes without notification)
-    // Only do this for non-leaders that were launched via native messaging
-    if !isEventTapLeader {
-        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
-            // Check if the current leader is still alive
-            if FileManager.default.fileExists(atPath: eventTapLockFile.path) {
-                if let contents = try? String(contentsOf: eventTapLockFile, encoding: .utf8),
-                   let leaderPid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    // Check if leader is still running
-                    if kill(leaderPid, 0) != 0 {
-                        debugLog("Detected dead leader (PID \(leaderPid)), attempting to take over")
-                        if tryBecomeEventTapLeader() {
-                            isEventTapLeader = true
-                            if setupEventTap() {
-                                debugLog("Successfully became event tap leader after detecting dead leader")
-                            }
-                        }
-                    }
-                }
-            } else {
-                // No lock file exists, try to become leader
-                debugLog("No lock file exists, attempting to become leader")
-                if tryBecomeEventTapLeader() {
-                    isEventTapLeader = true
-                    if setupEventTap() {
-                        debugLog("Successfully became event tap leader (no previous lock file)")
-                    }
+    // Keep checking even when we claimed leadership before Accessibility was granted.
+    // A live leader does not necessarily have a working keyboard listener.
+    Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+        if isEventTapLeader {
+            if !keyboardEventTap.isEnabled && AXIsProcessTrusted() {
+                if setupEventTap() {
+                    debugLog("Recovered keyboard listener after permission or timeout")
                 }
             }
+            return
+        }
+
+        if tryBecomeEventTapLeader() {
+            isEventTapLeader = true
+            if setupEventTap() { debugLog("Recovered event tap leadership") }
         }
     }
 }
@@ -2555,7 +2563,7 @@ func getFrontmostBrowserBundleId() -> String? {
 
 // Post notification to all native hosts - includes frontmost browser so only that browser responds
 func postCtrlTabNotification(direction: String, showUI: Bool, combineWindows: Bool) {
-    guard let frontmostBrowser = getFrontmostBrowserBundleId() else { return }
+    guard let frontmostBrowser = switchBrowserBundleId else { return }
     
     let center = DistributedNotificationCenter.default()
     center.postNotificationName(
@@ -2573,7 +2581,7 @@ func postCtrlTabNotification(direction: String, showUI: Bool, combineWindows: Bo
 }
 
 func postCtrlReleaseNotification() {
-    guard let frontmostBrowser = getFrontmostBrowserBundleId() else { return }
+    guard let frontmostBrowser = switchBrowserBundleId ?? getFrontmostBrowserBundleId() else { return }
     
     let center = DistributedNotificationCenter.default()
     center.postNotificationName(
@@ -2589,7 +2597,7 @@ func postRequestShowUINotification(combineWindows: Bool) {
     
     let center = DistributedNotificationCenter.default()
     center.postNotificationName(
-        NSNotification.Name("com.tabswitcher.requestShowUI"),
+        NSNotification.Name(ipcNamespace + ".requestShowUI"),
         object: nil,
         userInfo: ["combineWindows": combineWindows, "targetBrowser": frontmostBrowser],
         deliverImmediately: true
@@ -2620,22 +2628,8 @@ func eventTapCallback(
     
     // Handle tap disabled
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let refcon = refcon {
-            let tapRef = Unmanaged<AnyObject>.fromOpaque(refcon).takeUnretainedValue() as! CFMachPort
-            CGEvent.tapEnable(tap: tapRef, enable: true)
-        }
-        return Unmanaged.passRetained(event)
-    }
-    
-    // Only process when a supported browser is active
-    // Check against ALL known browsers (not just enabled ones) so it works before setup
-    guard let frontApp = NSWorkspace.shared.frontmostApplication,
-          let bundleId = frontApp.bundleIdentifier else {
-        return Unmanaged.passRetained(event)
-    }
-    
-    let allKnownBrowserIds = Set(knownBrowsers.map { $0.id })
-    guard allKnownBrowserIds.contains(bundleId) else {
+        // The callback has no userInfo; use the retained listener instead.
+        _ = keyboardEventTap.ensureEnabled()
         return Unmanaged.passRetained(event)
     }
     
@@ -2656,10 +2650,9 @@ func eventTapCallback(
 
         // Detect switch modifier release
         if switchModifierIsPressed && !modifierNowPressed && switchInProgress {
-            showUITimer?.cancel()
-            showUITimer = nil
             postCtrlReleaseNotification()
             switchInProgress = false
+            switchBrowserBundleId = nil
             tabPressCount = 0
         }
 
@@ -2667,37 +2660,45 @@ func eventTapCallback(
         return Unmanaged.passRetained(event)
     }
 
+    // Only process when a supported browser is active
+    // Check against ALL known browsers (not just enabled ones) so it works before setup
+    guard let frontApp = NSWorkspace.shared.frontmostApplication,
+          let bundleId = frontApp.bundleIdentifier else {
+        return Unmanaged.passRetained(event)
+    }
+
+    let allKnownBrowserIds = Set(knownBrowsers.map { $0.id })
+    guard allKnownBrowserIds.contains(bundleId) else {
+        return Unmanaged.passRetained(event)
+    }
+
+    // Local yields to an original leader, including one waiting for Accessibility.
+    if type == .keyDown && originalHelperConflict() { return Unmanaged.passRetained(event) }
+
     // Handle key down events
     if type == .keyDown {
         // Check for tab-switch shortcut (Shift excluded from base match — it toggles direction)
-        let baseMods = tabSwitchModifiers & modifierMask & ~CGEventFlags.maskShift.rawValue
-        let currentBase = currentMods & ~CGEventFlags.maskShift.rawValue
-        if keyCode == tabSwitchKeyCode && currentBase == baseMods {
+        if let step = switchDirection(key: keyCode, primaryKey: tabSwitchKeyCode,
+                                      graveKey: Int64(kVK_ANSI_Grave), baseModifiers: tabSwitchModifiers & modifierMask,
+                                      currentModifiers: currentMods, shiftMask: CGEventFlags.maskShift.rawValue,
+                                      inProgress: switchInProgress) {
+            guard acceptsSessionBrowser(target: switchBrowserBundleId, frontmost: bundleId) else {
+                return Unmanaged.passRetained(event)
+            }
             if !switchInProgress {
                 switchInProgress = true
+                switchBrowserBundleId = bundleId
                 tabPressCount = 0
             }
             switchModifierIsPressed = true
             tabPressCount += 1
 
-            let direction = (currentMods & CGEventFlags.maskShift.rawValue != 0) ? "cycle_prev" : "cycle_next"
-            let combineWindows = false
+            let direction = step < 0 ? "cycle_prev" : "cycle_next"
+            let combineWindows = BrowserConfigManager.shared.browsers.first { $0.id == bundleId }?.combineAllWindows ?? false
 
             debugLog("Broadcasting tab switch: direction=\(direction), tabPressCount=\(tabPressCount)")
 
-            if tabPressCount == 1 {
-                postCtrlTabNotification(direction: direction, showUI: false, combineWindows: combineWindows)
-                showUITimer?.cancel()
-                let timer = DispatchWorkItem {
-                    postRequestShowUINotification(combineWindows: combineWindows)
-                }
-                showUITimer = timer
-                DispatchQueue.main.asyncAfter(deadline: .now() + showUIDelay, execute: timer)
-            } else {
-                showUITimer?.cancel()
-                showUITimer = nil
-                postCtrlTabNotification(direction: direction, showUI: true, combineWindows: combineWindows)
-            }
+            postCtrlTabNotification(direction: direction, showUI: true, combineWindows: combineWindows)
 
             return nil
         }
@@ -2716,7 +2717,21 @@ func eventTapCallback(
 
 // MARK: - Setup Event Tap
 
+let keyboardEventTap = EventTapLifecycle<CFMachPort>(
+    create: createKeyboardEventTap,
+    isEnabled: { CGEvent.tapIsEnabled(tap: $0) },
+    enable: { CGEvent.tapEnable(tap: $0, enable: true) }
+)
+
 func setupEventTap() -> Bool {
+    let enabled = keyboardEventTap.ensureEnabled()
+    if !enabled {
+        sendAction("error_no_accessibility")
+    }
+    return enabled
+}
+
+func createKeyboardEventTap() -> CFMachPort? {
     let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue) |
                                   (1 << CGEventType.flagsChanged.rawValue)
     
@@ -2728,15 +2743,15 @@ func setupEventTap() -> Bool {
         callback: eventTapCallback,
         userInfo: nil
     ) else {
-        sendAction("error_no_accessibility")
-        return false
+        return nil
     }
-    
-    let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+
+    guard let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0) else {
+        CFMachPortInvalidate(eventTap)
+        return nil
+    }
     CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-    CGEvent.tapEnable(tap: eventTap, enable: true)
-    
-    return true
+    return eventTap
 }
 
 // MARK: - Message Reading Thread
@@ -2746,7 +2761,7 @@ func startMessageReader() {
     DispatchQueue.global(qos: .userInitiated).async {
         while true {
             if let message = readMessage() {
-                handleMessage(message)
+                DispatchQueue.main.async { handleMessage(message) }
             } else {
                 // Short sleep to prevent busy waiting
                 Thread.sleep(forTimeInterval: 0.01)
@@ -2792,21 +2807,6 @@ func isLaunchedDirectly() -> Bool {
     let isTTY = isatty(STDIN_FILENO) != 0
     debugLog("isatty check: \(isTTY)")
     return true  // If not a pipe, assume direct launch
-}
-
-// Check if another instance of the app is already running (for direct launch only)
-func isAnotherInstanceRunning() -> Bool {
-    let currentPID = ProcessInfo.processInfo.processIdentifier
-    let runningApps = NSWorkspace.shared.runningApplications
-    
-    // Look for other Tab Switcher instances (any activation policy)
-    for app in runningApps {
-        if app.bundleIdentifier == Bundle.main.bundleIdentifier,
-           app.processIdentifier != currentPID {
-            return true
-        }
-    }
-    return false
 }
 
 // Tell existing instances to show their config window
@@ -2869,44 +2869,6 @@ func main() {
     let directLaunch = isLaunchedDirectly()
     debugLog("Launched directly: \(directLaunch)")
     
-    // For direct launches, check if another DIRECTLY-LAUNCHED instance is already running
-    // (Native messaging hosts don't count - they can't show config windows)
-    if directLaunch {
-        let currentPID = ProcessInfo.processInfo.processIdentifier
-        var directlyLaunchedInstanceExists = false
-        
-        for app in NSWorkspace.shared.runningApplications {
-            if app.bundleIdentifier == Bundle.main.bundleIdentifier,
-               app.processIdentifier != currentPID,
-               app.activationPolicy == .regular {  // Only count apps showing in dock
-                directlyLaunchedInstanceExists = true
-                break
-            }
-        }
-        
-        if directlyLaunchedInstanceExists {
-            // Another directly-launched instance exists, activate it and exit
-            debugLog("Another directly-launched instance exists, activating it")
-            for app in NSWorkspace.shared.runningApplications {
-                if app.bundleIdentifier == Bundle.main.bundleIdentifier,
-                   app.activationPolicy == .regular {
-                    app.activate(options: [])
-                    break
-                }
-            }
-            exit(0)
-        }
-        
-        // No directly-launched instance, so we'll show the config
-        // (There might be native messaging hosts running, but they can't show config)
-        debugLog("No directly-launched instance found, we will show config")
-        
-        // Proactively check/request accessibility permission when launched directly
-        // This triggers the system permission prompt if not already granted
-        let hasAccessibility = checkAccessibilityPermission(prompt: true)
-        debugLog("Accessibility permission: \(hasAccessibility)")
-    }
-    
     // Try to become the event tap leader (only one native host should have the event tap)
     isEventTapLeader = tryBecomeEventTapLeader()
     
@@ -2961,19 +2923,8 @@ func main() {
     delegate.launchedDirectly = directLaunch
     app.delegate = delegate
     
-    if directLaunch {
-        // Show in dock when launched directly
-        app.setActivationPolicy(.regular)
-    } else {
-        // Run as background app when launched via native messaging
-        app.setActivationPolicy(.accessory)
-    }
-    
-    // Start Sparkle updater only when launched from Finder/Dock
-    if directLaunch {
-        updaterViewModel.startUpdater()
-        BackgroundUpdateChecker.shared.skipAppUpdateNotifications = true
-    }
+    // Start without a Dock flash; the delegate applies preferences after resolving launch role.
+    app.setActivationPolicy(.accessory)
 
     // Start background update checker (leader election ensures only one instance checks)
     BackgroundUpdateChecker.shared.startPeriodicChecks()
