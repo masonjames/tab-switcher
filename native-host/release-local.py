@@ -221,7 +221,7 @@ def verify_app(app, stage, identity):
         require(f"TeamIdentifier={TEAM}" in detail and "Authority=Developer ID Application:" in detail
                 and "Timestamp=" in detail and "runtime" in detail, f"Missing Developer ID/team/runtime/timestamp: {component}")
         certificate = stage / "evidence" / ("cert-" + str(uuid.uuid4()) + "-")
-        run(["codesign", "-d", "--extract-certificates", certificate, component], stage, stage)
+        run(["codesign", "-d", f"--extract-certificates={certificate}", component], stage, stage)
         require(hashlib.sha1(Path(str(certificate) + "0").read_bytes()).hexdigest().upper() == identity,
                 f"Unexpected signing certificate: {component}")
     # Check every Mach-O, including embedded helpers. Universal Sparkle is fine; Intel-only is not.

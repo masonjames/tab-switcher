@@ -52,13 +52,13 @@ is intended. Preserve the checked-in Local public key. The paired ID must remain
 
 Commit reviewed source changes before preparing (including this workflow).
 The checkout must have no tracked changes or untracked files. Choose the next
-unused `v<appVersion>-mason.N` tag. The examples use `v3.7.5-mason.3`; choose a
+unused `v<appVersion>-mason.N` tag. The examples use `v3.7.5-mason.4`; choose a
 new tag for later source changes. No local Git tag is required.
 
 ```sh
 python3 native-host/release-local.py --help
 python3 -m unittest discover -s tests -p 'test_release_local.py' -v
-python3 native-host/release-local.py prepare v3.7.5-mason.3 --identity YOUR_CURRENT_40_HEX_SHA1
+python3 native-host/release-local.py prepare v3.7.5-mason.4 --identity YOUR_CURRENT_40_HEX_SHA1
 ```
 
 Alternatively set `TAB_SWITCHER_SIGN_IDENTITY` to that public SHA1. Optional
@@ -82,10 +82,10 @@ team, timestamp, runtime and Mach-O arm64 compatibility is checked.
 ## Resume and review
 
 ```sh
-python3 native-host/release-local.py resume v3.7.5-mason.3
-cat dist/releases/v3.7.5-mason.3/state.json
-cat dist/releases/v3.7.5-mason.3/notarization-log.json
-cat dist/releases/v3.7.5-mason.3/assets/SHA256SUMS.txt
+python3 native-host/release-local.py resume v3.7.5-mason.4
+cat dist/releases/v3.7.5-mason.4/state.json
+cat dist/releases/v3.7.5-mason.4/notarization-log.json
+cat dist/releases/v3.7.5-mason.4/assets/SHA256SUMS.txt
 ```
 
 Each wait is at most 60 seconds; a timeout leaves Apple's job running. Resume
@@ -98,7 +98,7 @@ automatically submits again after intent is recorded. Reconcile with:
 xcrun notarytool history --keychain-profile TabSwitcher --output-format json
 xcrun notarytool info SUBMISSION_UUID --keychain-profile TabSwitcher --output-format json
 xcrun notarytool log SUBMISSION_UUID --keychain-profile TabSwitcher
-python3 native-host/release-local.py resume v3.7.5-mason.3 --submission-id SUBMISSION_UUID
+python3 native-host/release-local.py resume v3.7.5-mason.4 --submission-id SUBMISSION_UUID
 ```
 
 Use the profile chosen at prepare if customized. A supplied or recovered ID is
@@ -133,7 +133,7 @@ login, browser, clipboard or UI behavior. Perform attended acceptance separately
 Review the state, evidence and installation instructions first. Then:
 
 ```sh
-python3 native-host/release-local.py publish v3.7.5-mason.3
+python3 native-host/release-local.py publish v3.7.5-mason.4
 ```
 
 Publication rechecks local hashes, source snapshot, Accepted log and extracted
