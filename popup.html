@@ -56,6 +56,18 @@
       border: 1px solid rgba(239, 68, 68, 0.2);
     }
     
+    .status.warning { background: rgba(234, 179, 8, 0.1); border: 1px solid #806b23; color: #facc15; }
+    .status.warning .status-dot { background: #facc15; }
+    #health-detail { font-size: 12px; line-height: 1.5; color: #a1a1aa; margin-bottom: 10px; }
+    #health-detail { overflow-wrap: anywhere; }
+    #refresh-health {
+      margin-bottom: 16px; padding: 8px 12px; border: 1px solid #3f3f46;
+      border-radius: 6px; background: #18181b; color: #fafafa; font: inherit;
+      font-size: 12px; cursor: pointer;
+    }
+    #refresh-health:hover { background: #27272a; }
+    #refresh-health:disabled { opacity: 0.5; cursor: wait; }
+    #refresh-health:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
     .status-dot {
       width: 8px;
       height: 8px;
@@ -183,6 +195,8 @@
     <div class="status-text" id="status-text">Checking...</div>
   </div>
   
+  <p id="health-detail" role="status"></p>
+  <button id="refresh-health" type="button">Recheck shortcuts</button>
   <div class="update-banner" id="update-banner"></div>
 
   <div class="shortcut">

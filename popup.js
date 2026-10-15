@@ -1,27 +1,43 @@
-// Query connection status from service worker with actual ping test
+// Each refresh asks the elected native listener for a fresh runtime sample.
 const statusEl = document.getElementById("status");
 const statusTextEl = document.getElementById("status-text");
-
-// Set initial checking state
-statusEl.className = "status disconnected";
-statusTextEl.textContent = "Checking connection...";
-
-// Request a real ping test from the service worker
-chrome.runtime.sendMessage({ action: "ping_native_host" }, function(response) {
-  if (chrome.runtime.lastError) {
-    statusEl.className = "status disconnected";
-    statusTextEl.textContent = "Extension not responding";
-    return;
-  }
-
-  if (response && response.connected) {
-    statusEl.className = "status connected";
-    statusTextEl.textContent = "Connected to Tab Switcher app";
-  } else {
-    statusEl.className = "status disconnected";
-    statusTextEl.textContent = "Not connected — is the app running?";
-  }
-});
+const healthDetailEl = document.getElementById("health-detail");
+const refreshEl = document.getElementById("refresh-health");
+let healthRequest = 0;
+const companionApp = chrome.runtime.getManifest().name === "Tab Switcher Local" ? "Tab Switcher Local" : "Tab Switcher";
+const healthDetails = {
+  permissionDenied: `macOS is denying keyboard access even if its switch is ON. In System Settings → Privacy & Security → Device Control and Data Access (or Accessibility), remove only ${companionApp}. Add /Applications/${companionApp}.app again, enable it, then recheck.`,
+  listenerUnavailable: "The keyboard listener is inactive. Wait a few seconds and recheck. If it persists, open the app’s settings for permission recovery steps.",
+  originalConflict: "The original Tab Switcher helper is running. Disable its extension in every browser/profile and quit the original companion, then recheck.",
+  secureInput: "Secure Input is active. Finish password entry or turn off Secure Keyboard Entry in the app using it, then recheck.",
+  unknown: "Couldn’t verify shortcuts. Recheck in a moment. If this continues, quit and reopen the app, or update the app if it is an older version.",
+  ready: "Permission and listener checks passed. Try your shortcuts to confirm they work in this browser."
+};
+function refreshHealth() {
+  const request = ++healthRequest;
+  statusEl.className = "status warning";
+  statusTextEl.textContent = "Checking shortcuts…";
+  healthDetailEl.textContent = "";
+  refreshEl.disabled = true;
+  chrome.runtime.sendMessage({ action: "ping_native_host" }, function(response) {
+    if (request !== healthRequest) return;
+    refreshEl.disabled = false;
+    if (chrome.runtime.lastError || !response || !response.connected) {
+      statusEl.className = "status disconnected";
+      statusTextEl.textContent = "Not connected — is the app running?";
+      healthDetailEl.textContent = "The app did not respond. Recheck after opening the app.";
+      return;
+    }
+    const health = Object.prototype.hasOwnProperty.call(healthDetails, response.shortcutHealth) ? response.shortcutHealth : "unknown";
+    statusEl.className = health === "ready" ? "status connected" : "status warning";
+    statusTextEl.textContent = health === "ready" ? "Shortcuts ready"
+      : health === "unknown" ? "App connected — shortcut status unknown"
+      : "App connected — shortcuts unavailable";
+    healthDetailEl.textContent = healthDetails[health];
+  });
+}
+refreshEl.addEventListener("click", refreshHealth);
+refreshHealth();
 
 // Version info and update banner
 function compareVersions(a, b) {

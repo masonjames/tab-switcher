@@ -24,8 +24,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Tab Switcher Local</string>
 <key>CFBundleExecutable</key><string>tab-switcher</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>3.7.5</string>
-<key>CFBundleVersion</key><string>3.7.5</string>
+<key>CFBundleShortVersionString</key><string>3.7.6</string>
+<key>CFBundleVersion</key><string>3.7.6</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>

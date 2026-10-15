@@ -125,7 +125,7 @@ The app bundle will be at `dist/Tab Switcher.app`. Code signing and notarization
 
 **Extension shows "Not connected":**
 - Make sure the Tab Switcher app is running
-- Check that you've granted Accessibility permissions
+- Use **Recheck shortcuts** to distinguish an offline app from a permission failure.
 - Verify the Extension ID was entered correctly
 
 **Ctrl+Tab doesn't work:**
@@ -133,7 +133,7 @@ The app bundle will be at `dist/Tab Switcher.app`. Code signing and notarization
 - Make sure the browser window is focused.
 - In the original v3.7.5 app, granting permission after first launch can leave the keyboard listener inactive. Quit and reopen the **Tab Switcher app**; restarting Chrome alone does not restart the app that owns the listener.
 - This branch retries an inactive keyboard listener every five seconds after Accessibility permission is granted, and re-enables listeners disabled by macOS after a timeout.
-- The extension's “Connected” status confirms native messaging, not keyboard-listener health.
+- **Shortcuts ready** means fresh runtime checks passed; **App connected — shortcuts unavailable** includes guidance for permission, listener, or conflict failures. Unknown health is labeled separately.
 
 **Run the keyboard-listener recovery tests:**
 ```bash
@@ -212,3 +212,26 @@ forward/reverse events appeared in native logs, and settings reopened with both
 icons hidden. macOS reported launch at login enabled. Exact physical backtick
 behavior, the clipboard result, and startup after an actual login remain attended
 checks; no logout or reboot was performed.
+
+
+### Connected app, unavailable shortcuts
+
+Local source versions: app **3.7.6**, extension **3.7.5**. The popup separates
+native messaging connectivity from shortcut readiness. **Recheck shortcuts** asks
+the elected keyboard listener for fresh effective permission, enabled-listener,
+original-helper conflict and Secure Input status. Missing/older/unresponsive
+owners show unknown; a pong alone never means ready. App settings also refresh
+this status and offer **Retry**, **Open permission settings**, and **Reveal app**.
+
+If macOS denies permission even with the switch ON, open **System Settings →
+Privacy & Security → Device Control and Data Access** (macOS 27), called
+**Accessibility** on older versions. Remove **only Tab Switcher Local** from the
+list, add the exact **/Applications/Tab Switcher Local.app** again, and enable it.
+Then retry; the listener also retries every five seconds. The settings link uses
+macOS's Accessibility URL; if it opens only Privacy & Security, select the panel
+named above. No check changes permissions or repeatedly prompts for access.
+
+Quit the original helper if a conflict is reported. For Secure Input, finish
+password entry or disable Secure Keyboard Entry in the app using it, then
+recheck. A ready status verifies runtime prerequisites, not physical shortcuts:
+confirm forward, reverse and copy in your browser separately.

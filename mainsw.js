@@ -130,8 +130,23 @@ var processCommand = function(command) {
 chrome.commands.onCommand.addListener(processCommand);
 
 // Handle messages from popup
-var pendingPingCallback = null;
-var pingTimeout = null;
+var pendingPings = new Map();
+var pingSequence = 0;
+var pingSession = Date.now().toString(36) + Math.random().toString(36).slice(2);
+function finishPing(id, response) {
+	var pending = pendingPings.get(id);
+	if (!pending) return;
+	pendingPings.delete(id);
+	clearTimeout(pending.timer);
+	pending.respond(response);
+}
+function finishAllPings(response) {
+	Array.from(pendingPings.keys()).forEach(id => finishPing(id, response));
+}
+function normalizedHealth(value) {
+	return ["ready", "permissionDenied", "listenerUnavailable", "originalConflict", "secureInput", "unknown"].includes(value)
+		? value : "unknown";
+}
 
 chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 	if (request.action === "get_connection_status") {
@@ -147,50 +162,23 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 	}
 
 	if (request.action === "ping_native_host") {
-		// Clear any previous pending ping
-		if (pingTimeout) {
-			clearTimeout(pingTimeout);
-			pingTimeout = null;
-		}
-		if (pendingPingCallback) {
-			pendingPingCallback = null;
-		}
-		
-		// If no port or not connected, try to connect first
-		if (!nativePort) {
-			connectNativeHost();
-		}
-		
+		if (!nativePort) connectNativeHost();
 		if (!nativePort) {
 			sendResponse({ connected: false });
 			return true;
 		}
-		
-		// Set up callback for pong response
-		pendingPingCallback = function(success) {
-			sendResponse({ connected: success });
-		};
-		
-		// Set timeout for ping response
-		pingTimeout = setTimeout(function() {
-			if (pendingPingCallback) {
-				pendingPingCallback(false);
-				pendingPingCallback = null;
-			}
+		var id = pingSession + ":" + (++pingSequence);
+		var pending = { respond: sendResponse, timer: null };
+		pendingPings.set(id, pending);
+		pending.timer = setTimeout(function() {
+			finishPing(id, { connected: nativeHostConnected && nativePort !== null, shortcutHealth: "unknown" });
 		}, 2000);
-		
-		// Send ping
 		try {
-			sendToNativeHost({ action: "ping" });
+			nativePort.postMessage({ action: "ping", requestId: id });
 		} catch (e) {
-			log("Ping failed: " + e.message);
-			if (pendingPingCallback) {
-				pendingPingCallback(false);
-				pendingPingCallback = null;
-			}
-			clearTimeout(pingTimeout);
+			finishPing(id, { connected: false, shortcutHealth: "unknown" });
 		}
-		
+
 		return true; // Keep channel open for async response
 	}
 });
@@ -566,13 +554,11 @@ var connectNativeHost = function() {
 					chrome.storage.local.set({ shortcuts: message.shortcuts });
 				}
 			} else if (message.action === "pong") {
-				// Ping response - connection is alive
-				log("Received pong - connection alive");
-				if (pendingPingCallback) {
-					clearTimeout(pingTimeout);
-					pendingPingCallback(true);
-					pendingPingCallback = null;
-					pingTimeout = null;
+				if (typeof message.requestId === "string") {
+					finishPing(message.requestId, { connected: true, shortcutHealth: normalizedHealth(message.shortcutHealth) });
+				} else {
+					// Legacy/unsolicited pongs prove transport only, never readiness.
+					finishAllPings({ connected: true, shortcutHealth: "unknown" });
 				}
 			} else if (message.action === "cycle_next") {
 				enqueueNativeSwitch(() => handleNativeCycle(1, message.show_ui, message.current_window_only, message.recent_tab_limit));
@@ -586,12 +572,13 @@ var connectNativeHost = function() {
 				handleCopyUrl();
 			} else if (message.action === "error_no_accessibility") {
 				log("Native host error: No accessibility permissions");
-				nativeHostConnected = false;
+				// Permission failure does not mean the transport disconnected.
 			}
 		});
 
 		nativePort.onDisconnect.addListener(function() {
 			log("Native host disconnected");
+			finishAllPings({ connected: false, shortcutHealth: "unknown" });
 			if (chrome.runtime.lastError) {
 				log("Native host error: " + chrome.runtime.lastError.message);
 			}
@@ -866,7 +853,7 @@ chrome.windows.onFocusChanged.addListener(function(windowId) {
 		} else {
 			// Send a ping to verify the connection is still working
 			try {
-				sendToNativeHost({ action: "ping" });
+				sendToNativeHost({ action: "ping", requestId: pingSession + ":background:" + (++pingSequence) });
 			} catch (e) {
 				log("Ping failed, reconnecting: " + e.message);
 				nativePort = null;

@@ -8,7 +8,7 @@ import EventTapLifecycle
 import CompanionPolicy
 import UserNotifications
 
-let APP_VERSION = "3.7.5"
+let APP_VERSION = "3.7.6"
 let CWS_EXTENSION_ID = "pbpgegamabjlnegmfcjelciaenfkmfoo"
 let CWS_URL = "https://chromewebstore.google.com/detail/tab-switcher/pbpgegamabjlnegmfcjelciaenfkmfoo"
 
@@ -2135,9 +2135,11 @@ func handleMessage(_ message: [String: Any]) {
         }
         
     case "ping":
-        // Respond to ping to confirm connection is alive
-        debugLog("Received ping, sending pong")
-        sendMessage(["action": "pong"])
+        requestShortcutHealth { health in
+            var reply: [String: Any] = ["action": "pong", "shortcutHealth": health.rawValue]
+            if let id = message["requestId"] as? String { reply["requestId"] = id }
+            sendMessage(reply)
+        }
 
     case "url_copied":
         if let url = message["url"] as? String {
@@ -2335,6 +2337,33 @@ func detectParentBrowser() -> (String, pid_t)? {
 // Lock file for event tap coordination - only one native host should have the event tap
 let eventTapLockFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(isLocalBuild ? ".tabswitcher_local_eventtap.lock" : ".tabswitcher_eventtap.lock")
 
+func electedListenerPID() -> Int32? {
+    guard let record = try? String(contentsOf: eventTapLockFile, encoding: .utf8),
+          let pid = Int32(record.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0,
+          kill(pid, 0) == 0 || errno == EPERM else { return nil }
+    return pid
+}
+
+func localShortcutHealth() -> ShortcutHealth? {
+    guard isEventTapLeader, electedListenerPID() == getpid() else { return nil }
+    return ShortcutHealth.sample(trusted: AXIsProcessTrusted(), listenerEnabled: keyboardEventTap.isEnabled,
+        originalConflict: originalHelperConflict(), secureInput: IsSecureEventInputEnabled())
+}
+
+let shortcutHealthProbe = ShortcutHealthProbe(owner: electedListenerPID,
+    now: { ProcessInfo.processInfo.systemUptime })
+
+func requestShortcutHealth(_ completion: @escaping (ShortcutHealth) -> Void) {
+    let id = shortcutHealthProbe.request(localPID: getpid(), localSample: localShortcutHealth, send: { id in
+        DistributedNotificationCenter.default().postNotificationName(
+            NSNotification.Name(ipcNamespace + ".healthRequest"), object: nil,
+            userInfo: ["id": id], deliverImmediately: true)
+    }, completion: completion)
+    if let id {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { shortcutHealthProbe.expire(id: id) }
+    }
+}
+
 // Check if we should be the event tap leader (first one to claim the lock)
 let eventTapInstanceLock = InstanceLock()
 func tryBecomeEventTapLeader() -> Bool {
@@ -2377,6 +2406,19 @@ let shortcutsChangedNotificationName = ipcNamespace + ".shortcutsChanged"
 // Setup listener for distributed notifications (for non-leader hosts)
 func setupNotificationListener() {
     let center = DistributedNotificationCenter.default()
+    center.addObserver(forName: NSNotification.Name(ipcNamespace + ".healthRequest"), object: nil, queue: .main) { notification in
+        guard let id = notification.userInfo?["id"] as? String,
+              let health = localShortcutHealth() else { return }
+        center.postNotificationName(NSNotification.Name(ipcNamespace + ".healthResponse"), object: nil,
+            userInfo: ["id": id, "owner": getpid(), "health": health.rawValue], deliverImmediately: true)
+    }
+    center.addObserver(forName: NSNotification.Name(ipcNamespace + ".healthResponse"), object: nil, queue: .main) { notification in
+        guard let data = notification.userInfo, let id = data["id"] as? String,
+              let pid = data["owner"] as? Int32, let value = data["health"] as? String,
+              let health = ShortcutHealth(rawValue: value) else { return }
+        shortcutHealthProbe.receive(id: id, owner: pid, health: health)
+    }
+
     
     center.addObserver(forName: NSNotification.Name(ctrlTabNotificationName), object: nil, queue: .main) { notification in
         guard let userInfo = notification.userInfo,
@@ -2839,7 +2881,7 @@ func checkAccessibilityPermission(prompt: Bool = false) -> Bool {
 func showAccessibilityAlert() {
     let alert = NSAlert()
     alert.messageText = "Accessibility Permission Required"
-    alert.informativeText = "Tab Switcher needs Accessibility permission to intercept Ctrl+Tab.\n\nClick 'Open System Settings' to grant permission, then relaunch the app."
+    alert.informativeText = permissionRecoveryGuidance
     alert.alertStyle = .warning
     alert.addButton(withTitle: "Open System Settings")
     alert.addButton(withTitle: "Continue Anyway")
@@ -2849,11 +2891,7 @@ func showAccessibilityAlert() {
     
     switch response {
     case .alertFirstButtonReturn:
-        // Open Accessibility settings
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
-        exit(0)
+        openPermissionSettings()
     case .alertSecondButtonReturn:
         // Continue without event tap (config only)
         break

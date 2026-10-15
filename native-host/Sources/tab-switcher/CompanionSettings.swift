@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import ServiceManagement
 import CompanionPolicy
+import EventTapLifecycle
 
 let isLocalBuild = Bundle.main.object(forInfoDictionaryKey: "TabSwitcherLocalBuild") as? Bool == true
 let configurationDirectory = isLocalBuild ? "TabSwitcherLocal" : "TabSwitcher"
@@ -17,6 +18,27 @@ func originalHelperConflict() -> Bool {
     }
 }
 
+let permissionRecoveryGuidance = "Open System Settings → Privacy & Security → Device Control and Data Access (macOS 27), or Accessibility on older macOS. The switch may already be ON even when macOS denies access. " + (isLocalBuild
+    ? "Remove only the Tab Switcher Local entry, add the exact /Applications/Tab Switcher Local.app again, and enable it."
+    : "Remove only the Tab Switcher entry, add /Applications/Tab Switcher.app again, and enable it.") + " Then retry. Shortcut access is also checked again automatically."
+
+func openPermissionSettings() {
+    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+        NSWorkspace.shared.open(url)
+    }
+}
+
+func shortcutHealthDescription(_ health: ShortcutHealth) -> String {
+    switch health {
+    case .ready: return "Shortcuts ready — permission and listener checks passed."
+    case .permissionDenied: return "Shortcuts unavailable — macOS is denying permission. " + permissionRecoveryGuidance
+    case .listenerUnavailable: return "Shortcuts unavailable — the keyboard listener is inactive. Retry in a few seconds. If it persists, check permission. " + permissionRecoveryGuidance
+    case .originalConflict: return "Shortcuts unavailable — the original Tab Switcher helper is running. Disable its extension in every browser/profile and quit the original companion."
+    case .secureInput: return "Shortcuts unavailable — Secure Input is active. Finish entering passwords or turn off Secure Keyboard Entry in the app using it, then retry."
+    case .unknown: return "Couldn’t verify shortcuts. Retry in a moment. If this continues, quit and reopen the app and check that the latest version is installed."
+    }
+}
+
 final class CompanionSettings: ObservableObject {
     static let shared = CompanionSettings()
     private let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -24,6 +46,17 @@ final class CompanionSettings: ObservableObject {
     @Published var preferences: CompanionPreferences
     @Published var loginStatus: SMAppService.Status = .notRegistered
     @Published var errorMessage: String?
+    @Published var shortcutHealth: ShortcutHealth = .unknown
+    @Published var checkingHealth = false
+    func refreshHealth() {
+        guard !checkingHealth else { return }
+        checkingHealth = true
+        shortcutHealth = .unknown
+        requestShortcutHealth { [weak self] health in
+            self?.shortcutHealth = health
+            self?.checkingHealth = false
+        }
+    }
     @Published var originalConflict = false
     func refreshConflict() { originalConflict = originalHelperConflict() }
 
@@ -68,6 +101,16 @@ struct CompanionSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Companion").font(.headline)
+            Text(settings.checkingHealth ? "Checking shortcuts…" : shortcutHealthDescription(settings.shortcutHealth))
+                .font(.caption).foregroundColor(settings.shortcutHealth == .ready ? .secondary : .orange)
+            HStack {
+                Button("Open permission settings") { openPermissionSettings() }
+                Button("Retry") { settings.refreshHealth() }.disabled(settings.checkingHealth)
+                Button("Reveal app") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: isLocalBuild
+                        ? "/Applications/Tab Switcher Local.app" : "/Applications/Tab Switcher.app")])
+                }
+            }
             if isLocalBuild {
                 Text(settings.originalConflict
                     ? "Original Tab Switcher leader is still running. Local keyboard shortcuts are paused. Disable the original extension in every browser/profile, then quit the original companion before enabling Local."
@@ -89,8 +132,8 @@ struct CompanionSettingsView: View {
                 .font(.caption).foregroundStyle(.secondary)
             if let error = settings.errorMessage { Text(error).font(.caption).foregroundStyle(.red) }
         }
-        .onAppear { settings.refreshLoginStatus(); settings.refreshConflict() }
-        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in settings.refreshConflict() }
+        .onAppear { settings.refreshLoginStatus(); settings.refreshConflict(); settings.refreshHealth() }
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in settings.refreshConflict(); settings.refreshHealth() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in settings.refreshLoginStatus() }
     }
 }
