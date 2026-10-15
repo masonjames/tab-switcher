@@ -149,6 +149,8 @@ MIT License — see [LICENSE](LICENSE)
 
 ## Mason’s local fork
 
+For repeatable signed, notarized releases, see [Releasing the Local fork](docs/releasing.md).
+
 Run `bash native-host/build-local.sh` from a clean checkout to produce
 `dist/Tab Switcher Local.app`. This standalone, ad-hoc signed bundle embeds the
 pinned Sparkle 2.8.1 framework and fixes its runtime search path. The script needs

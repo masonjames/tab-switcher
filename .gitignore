@@ -16,3 +16,6 @@ dist/
 
 # Debug logs
 *.log
+
+# Python release tooling caches (release state/evidence are covered by dist/ above)
+__pycache__/
